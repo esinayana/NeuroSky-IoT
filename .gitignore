@@ -1,0 +1,4 @@
+build/*
+*.VC.DB
+*.VC.DB-shm
+*.VC.DB-wal
