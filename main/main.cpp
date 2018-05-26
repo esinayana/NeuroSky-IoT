@@ -11,6 +11,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/event_groups.h"
+
+#include "esp_wifi.h"
+#include "esp_event_loop.h"
 
 #include "esp_log.h"
 
@@ -22,11 +26,24 @@
 #include "time.h"
 #include "sys/time.h"
 
+extern "C" {
+#include "mqtt_client.h"
+}
+
 typedef unsigned char   byte;
 
+/*Set the SSID and Password via "make menuconfig"*/
+#define DEFAULT_SSID    CONFIG_WIFI_SSID
+#define DEFAULT_PWD     CONFIG_WIFI_PASSWORD
+
+#define DEFAULT_SCAN_METHOD WIFI_FAST_SCAN
+#define DEFAULT_SORT_METHOD WIFI_CONNECT_AP_BY_SIGNAL
+
+#define DEFAULT_RSSI    -127
+#define DEFAULT_AUTHMODE WIFI_AUTH_OPEN
 
 // Access token for Ubidots account.
-#define TOKEN ""
+#define TOKEN "token"
 
 /* 
  * MQTT client Name, please enter your own 8-12 alphanumeric character ASCII string; 
@@ -37,37 +54,12 @@ typedef unsigned char   byte;
 #define MEDITATION_VAR_LABEL "meditation" // Assign the variable label
 #define DEVICE_LABEL "esp32-neuro" // Assign the device label
 
-const char mqttBroker[]  = "things.ubidots.com";
+const char mqttBroker[]  = "mqtt://things.ubidots.com";
 
-// Wi-Fi connection object.
-//WiFiClient wlan;
 // Web client used to communicate with IoT cloud service (Ubidots).
-//PubSubClient client(wlan);
+esp_mqtt_client_handle_t client = 0;
 
-
-#if 1
-/*
- * Debug message function.
- * Currently uses serial port for output.
- * @param[in]   lvl - (Not used)
- * @param[in]   fmt - printf()-like format string
- * @param[in]   args... - printf() arguments for string formatting.
- */
-template <class... Args>
-void trace(const char* lvl, const char* fmt, Args... args)
-{
-    char buf[256];
-    sprintf(buf, fmt, args...);
-
-//    ESP_LOGI(lvl, buf);
-}
-#else
-#define trace(_tag, _fmt, ...) //  ESP_LOGI(_tag, _fmt, ##__VA_ARGS__)
-#endif
-
-#define GAP_TAG          "GAP"
-#define SPP_TAG          "SPP"
-
+#define TAG     "NEURO"
 
 typedef enum {
     APP_GAP_STATE_IDLE = 0,
@@ -142,6 +134,35 @@ int millis()
     return xTaskGetTickCount() * portTICK_PERIOD_MS;
 }
 
+static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
+{
+    switch (event->event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        esp_mqtt_client_start(client);
+        break;
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+        break;
+    }
+    return ESP_OK;
+}
+
 static bool get_name_from_eir(uint8_t *eir, uint8_t *bdname, uint8_t *bdname_len)
 {
     uint8_t* rmt_bdname = nullptr;
@@ -182,22 +203,22 @@ static void update_device_info(esp_bt_gap_cb_param_t *param)
     char bdname[64] = {};
     esp_bt_gap_dev_prop_t *p;
 
-    ESP_LOGI(GAP_TAG, "Device found: %s", bda2str(param->disc_res.bda, bda_str, 18));
+    ESP_LOGI(TAG, "Device found: %s", bda2str(param->disc_res.bda, bda_str, 18));
     for (int i = 0; i < param->disc_res.num_prop; i++) {
         p = param->disc_res.prop + i;
         switch (p->type) {
         case ESP_BT_GAP_DEV_PROP_COD:
             cod = *(uint32_t *)(p->val);
-            ESP_LOGI(GAP_TAG, "--Class of Device: 0x%x", cod);
+            ESP_LOGI(TAG, "--Class of Device: 0x%x", cod);
             break;
         case ESP_BT_GAP_DEV_PROP_RSSI:
             rssi = *(int8_t *)(p->val);
-            ESP_LOGI(GAP_TAG, "--RSSI: %d", rssi);
+            ESP_LOGI(TAG, "--RSSI: %d", rssi);
             break;
         case ESP_BT_GAP_DEV_PROP_BDNAME:
             memcpy(bdname, p->val, p->len);
             bdname[p->len] = '\0';
-            ESP_LOGI(GAP_TAG, "--Name of Device: %s", bdname);
+            ESP_LOGI(TAG, "--Name of Device: %s", bdname);
             break;
 
         default:
@@ -255,10 +276,10 @@ static void update_device_info(esp_bt_gap_cb_param_t *param)
         }
 #endif
 
-        ESP_LOGI(GAP_TAG, "Found a target device, address %s, name %s", bda_str, p_dev->bdname);
+        ESP_LOGI(TAG, "Found a target device, address %s, name %s", bda_str, p_dev->bdname);
 
         p_dev->state = APP_GAP_STATE_DEVICE_DISCOVER_COMPLETE;
-        ESP_LOGI(GAP_TAG, "Cancel device discovery ...");
+        ESP_LOGI(TAG, "Cancel device discovery ...");
         esp_bt_gap_cancel_discovery();
     }
 }
@@ -273,40 +294,45 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 {
     switch (event) {
     case ESP_SPP_INIT_EVT:
-        ESP_LOGI(SPP_TAG, "ESP_SPP_INIT_EVT");
+        ESP_LOGI(TAG, "ESP_SPP_INIT_EVT");
         esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
         esp_bt_gap_start_discovery(inq_mode, inq_len, inq_num_rsps);
         break;
 
     case ESP_SPP_DISCOVERY_COMP_EVT:
-        ESP_LOGI(SPP_TAG, "ESP_SPP_DISCOVERY_COMP_EVT status=%d scn_num=%d",param->disc_comp.status, param->disc_comp.scn_num);
+        ESP_LOGI(TAG, "ESP_SPP_DISCOVERY_COMP_EVT status=%d scn_num=%d",param->disc_comp.status, param->disc_comp.scn_num);
         if (param->disc_comp.status == ESP_SPP_SUCCESS) {
+            char bda_str[18];
+            ESP_LOGI(TAG, "ESP_SPP_INIT_EVT %d %s", param->disc_comp.scn[0], bda2str(m_dev_info.bda, bda_str, 18));
             esp_spp_connect(sec_mask, role_master, param->disc_comp.scn[0], m_dev_info.bda);
+        } else {
+            esp_bt_gap_start_discovery(inq_mode, inq_len, inq_num_rsps);
         }
         break;
 
     case ESP_SPP_OPEN_EVT:
-        ESP_LOGI(SPP_TAG, "ESP_SPP_OPEN_EVT");
+        ESP_LOGI(TAG, "ESP_SPP_OPEN_EVT");
 //        esp_spp_write(param->srv_open.handle, SPP_DATA_LEN, spp_data);
 //        gettimeofday(&time_old, NULL);
         break;
 
     case ESP_SPP_CLOSE_EVT:
-        ESP_LOGI(SPP_TAG, "ESP_SPP_CLOSE_EVT");
+        ESP_LOGI(TAG, "ESP_SPP_CLOSE_EVT");
+        esp_bt_gap_start_discovery(inq_mode, inq_len, inq_num_rsps);
         break;
 
     case ESP_SPP_START_EVT:
-        ESP_LOGI(SPP_TAG, "ESP_SPP_START_EVT");
+        ESP_LOGI(TAG, "ESP_SPP_START_EVT");
         break;
     case ESP_SPP_CL_INIT_EVT:
-        ESP_LOGI(SPP_TAG, "ESP_SPP_CL_INIT_EVT");
+        ESP_LOGI(TAG, "ESP_SPP_CL_INIT_EVT");
         break;
 
     case ESP_SPP_DATA_IND_EVT:
         for (int i = 0; i < param->data_ind.len; ++i) {
 //            if (!serialBuffer.pushBack(param->data_ind.data[i])) {
             if (xQueueSend(serialQueue, &param->data_ind.data[i], 10 / portTICK_RATE_MS) != pdTRUE) {
-                ESP_LOGW(SPP_TAG, "serial in> [!] buffer overflow! Dropping %d bytes", param->data_ind.len - i);
+                ESP_LOGW(TAG, "serial in> [!] buffer overflow! Dropping %d bytes", param->data_ind.len - i);
                 break;
             }
         }
@@ -314,7 +340,7 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 
     case ESP_SPP_CONG_EVT:
 #if (SPP_SHOW_MODE == SPP_SHOW_DATA)
-        ESP_LOGI(SPP_TAG, "ESP_SPP_CONG_EVT cong=%d", param->cong.cong);
+        ESP_LOGI(TAG, "ESP_SPP_CONG_EVT cong=%d", param->cong.cong);
 #endif
         if (param->cong.cong == 0) {
 //            esp_spp_write(param->cong.handle, SPP_DATA_LEN, spp_data);
@@ -323,7 +349,7 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 
     case ESP_SPP_WRITE_EVT:
 #if (SPP_SHOW_MODE == SPP_SHOW_DATA)
-        ESP_LOGI(SPP_TAG, "ESP_SPP_WRITE_EVT len=%d cong=%d", param->write.len , param->write.cong);
+        ESP_LOGI(TAG, "ESP_SPP_WRITE_EVT len=%d cong=%d", param->write.len , param->write.cong);
 #else
         gettimeofday(&time_new, NULL);
         data_num += param->write.len;
@@ -337,7 +363,7 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
         break;
 
     case ESP_SPP_SRV_OPEN_EVT:
-        ESP_LOGI(SPP_TAG, "ESP_SPP_SRV_OPEN_EVT");
+        ESP_LOGI(TAG, "ESP_SPP_SRV_OPEN_EVT");
         break;
     }
 }
@@ -356,14 +382,18 @@ void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     }
     case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {
         if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
-            trace(GAP_TAG, "Device discovery stopped.");
+            ESP_LOGI(TAG, "Device discovery stopped.");
             if (p_dev->dev_found && (p_dev->state == APP_GAP_STATE_DEVICE_DISCOVER_COMPLETE || p_dev->state == APP_GAP_STATE_DEVICE_DISCOVERING)) {
+                char bda_str[18];
+                
                 p_dev->state = APP_GAP_STATE_SERVICE_DISCOVERING;
-                trace(GAP_TAG, "start SPP discovery...");
+                ESP_LOGI(TAG, "start SPP discovery... %s", bda2str(m_dev_info.bda, bda_str, 18));
                 esp_spp_start_discovery(m_dev_info.bda);
+            } else {
+                esp_bt_gap_start_discovery(inq_mode, inq_len, inq_num_rsps);
             }
         } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
-            trace(GAP_TAG, "Discovery started.");
+            ESP_LOGI(TAG, "Discovery started.");
         }
         break;
     }
@@ -372,14 +402,14 @@ void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
             p_dev->state == APP_GAP_STATE_SERVICE_DISCOVERING) {
             p_dev->state = APP_GAP_STATE_SERVICE_DISCOVER_COMPLETE;
             if (param->rmt_srvcs.stat == ESP_BT_STATUS_SUCCESS) {
-                trace(GAP_TAG, "Services for device %s found",  bda2str(p_dev->bda, bda_str, 18));
+                ESP_LOGI(TAG, "Services for device %s found",  bda2str(p_dev->bda, bda_str, 18));
                 for (int i = 0; i < param->rmt_srvcs.num_uuids; i++) {
                     esp_bt_uuid_t *u = param->rmt_srvcs.uuid_list + i;
-                    trace(GAP_TAG, "--%s", uuid2str(u, uuid_str, 37));
-                    // trace(GAP_TAG, "--%d", u->len);
+                    ESP_LOGI(TAG, "--%s", uuid2str(u, uuid_str, 37));
+                    // trace(TAG, "--%d", u->len);
                 }
             } else {
-                trace(GAP_TAG, "Services for device %s not found",  bda2str(p_dev->bda, bda_str, 18));
+                ESP_LOGI(TAG, "Services for device %s not found",  bda2str(p_dev->bda, bda_str, 18));
             }
         }
         break;
@@ -387,7 +417,7 @@ void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 
     case ESP_BT_GAP_RMT_SRVC_REC_EVT:
     default:
-        trace(GAP_TAG, "event: %d", event);
+        ESP_LOGI(TAG, "event: %d", event);
         break;
     }
     return;
@@ -406,12 +436,12 @@ void initBluetooth()
 
     esp_err_t ret = 0;
     if ((ret = esp_spp_register_callback(esp_spp_cb)) != ESP_OK) {
-        trace(SPP_TAG, "SPP register failed: %s", esp_err_to_name(ret));
+        ESP_LOGI(TAG, "SPP register failed: %s", esp_err_to_name(ret));
         return;
     }
 
     if ((ret = esp_spp_init(esp_spp_mode)) != ESP_OK) {
-        trace(SPP_TAG, "SPP init failed: %s", __func__, esp_err_to_name(ret));
+        ESP_LOGI(TAG, "SPP init failed: %s", esp_err_to_name(ret));
         return;
     }
 
@@ -425,83 +455,76 @@ void initBluetooth()
 }
 
 
-#if 0
-void callback(char* topic, byte* payload, unsigned int length)
-{
-    Serial.print("Message arrived [");
-    Serial.print(topic);
-    Serial.print("] ");
-    for (int i = 0; i < length; ++i) {
-        Serial.print((char)payload[i]);
-    }
-    Serial.println();
-}
-void reconnect() {
-    // Loop until we're reconnected
-    while (!client.connected()) {
-        Serial.println("Attempting MQTT connection...");
-
-        // Attemp to connect
-        if (client.connect(MQTT_CLIENT_NAME, TOKEN, "")) {
-            Serial.println("Connected");
-        } else {
-            Serial.print("Failed, rc=");
-            Serial.print(client.state());
-            Serial.println(" try again in 2 seconds");
-            // Wait 2 seconds before retrying
-            delay(2000);
-        }
-    }
-}
-#endif // 0
-
 bool btStart()
 {
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t ret;
 
     if ((ret = esp_bt_controller_init(&bt_cfg)) != ESP_OK) {
-        ESP_LOGE(SPP_TAG, "%s initialize controller failed: %s\n", __func__, esp_err_to_name(ret));
+        ESP_LOGE(TAG, "%s initialize controller failed: %s\n", __func__, esp_err_to_name(ret));
         return false;
     }
 
     if ((ret = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT)) != ESP_OK) {
-        ESP_LOGE(SPP_TAG, "%s enable controller failed: %s\n", __func__, esp_err_to_name(ret));
+        ESP_LOGE(TAG, "%s enable controller failed: %s\n", __func__, esp_err_to_name(ret));
         return false;
     }
 
     return true;
 }
 
+
+static esp_err_t event_handler(void *ctx, system_event_t *event)
+{
+    switch (event->event_id) {
+        case SYSTEM_EVENT_STA_START:
+            ESP_LOGI(TAG, "SYSTEM_EVENT_STA_START");
+            ESP_ERROR_CHECK(esp_wifi_connect());
+            break;
+
+        case SYSTEM_EVENT_STA_GOT_IP:
+            ESP_LOGI(TAG, "SYSTEM_EVENT_STA_GOT_IP");
+            ESP_LOGI(TAG, "Got IP: %s\n",
+                     ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
+            esp_mqtt_client_start(client);
+            break;
+
+        case SYSTEM_EVENT_STA_DISCONNECTED:
+            ESP_LOGI(TAG, "SYSTEM_EVENT_STA_DISCONNECTED");
+            ESP_ERROR_CHECK(esp_wifi_connect());
+            break;
+
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+
+/* Initialize Wi-Fi as sta and set scan method */
+void wifi_init()
+{
+    tcpip_adapter_init();
+    ESP_ERROR_CHECK(esp_event_loop_init(event_handler, nullptr));
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    wifi_config_t wifi_config = {};
+    strcpy((char*)wifi_config.sta.ssid, DEFAULT_SSID);
+    strcpy((char*)wifi_config.sta.password, DEFAULT_PWD);
+    wifi_config.sta.scan_method = DEFAULT_SCAN_METHOD;
+    wifi_config.sta.sort_method = DEFAULT_SORT_METHOD;
+    wifi_config.sta.threshold.rssi = DEFAULT_RSSI;
+    wifi_config.sta.threshold.authmode = DEFAULT_AUTHMODE;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+
 void setup()
 {
-    ESP_LOGE(GAP_TAG, "setup() called");
-
-#if 0
-    while (!Serial)
-        delay(10);     // will pause Zero, Leonardo, etc until serial console opens
-
-    // Set up WLAN connection.
-    Serial.println();
-    Serial.println();
-    Serial.print("Connecting to ");
-    Serial.println(ssid);
-
-    WiFi.begin(ssid, password);
-
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-
-    Serial.println("");
-    Serial.println("WiFi connected");
-    Serial.println("IP address: ");
-    Serial.println(WiFi.localIP());
-
-    client.setServer(mqttBroker, 1883);
-    client.setCallback(callback);
-#endif // 0
+    ESP_LOGE(TAG, "setup() called");
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES) {
@@ -510,24 +533,26 @@ void setup()
     }
     ESP_ERROR_CHECK(ret);
 
+    wifi_init();
+
     if (!btStart()) {
-        ESP_LOGE(GAP_TAG, "Failed to initialize controller");
+        ESP_LOGE(TAG, "Failed to initialize controller");
         return;
     }
 
     if (esp_bluedroid_init() != ESP_OK) {
-        ESP_LOGE(GAP_TAG, "Failed to initialize bluedroid");
+        ESP_LOGE(TAG, "Failed to initialize bluedroid");
         return;
     }
 
     if (esp_bluedroid_enable() != ESP_OK) {
-        ESP_LOGE(GAP_TAG, "Failed to enable bluedroid");
+        ESP_LOGE(TAG, "Failed to enable bluedroid");
         return;
     }
 
     initBluetooth();
 
-    ESP_LOGE(GAP_TAG, "setup() OK");
+    ESP_LOGE(TAG, "setup() OK");
 }
 
 byte poorQuality = 0;
@@ -632,7 +657,7 @@ void loop()
                     else
                         digitalWrite(LED, LOW);
 #endif
-                    ESP_LOGI(GAP_TAG, "PoorQuality: %d, Attention: %d, Meditation: %d, Time since last packet: %ld",
+                    ESP_LOGI(TAG, "PoorQuality: %d, Attention: %d, Meditation: %d, Time since last packet: %ld",
                         poorQuality, attention, meditation, millis() - lastReceivedPacket);
 
                     char payload[100];
@@ -641,8 +666,10 @@ void loop()
                     sprintf(topic, "/v1.6/devices/%s", DEVICE_LABEL); // Format topic
                     sprintf(payload, "{\"" ATTENTION_VAR_LABEL "\":%u, \"" MEDITATION_VAR_LABEL "\":%u}", attention, meditation);
 
-                    ESP_LOGI(GAP_TAG, "Publishing data to Ubidots Cloud: %s, %s", topic, payload);
+                    ESP_LOGI(TAG, "Publishing data to Ubidots Cloud: %s, %s", topic, payload);
 
+                    int msg_id = esp_mqtt_client_publish(client, topic, payload, 0, 0, 0);
+                    ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
 //                    client.publish(topic, payload);
                 }
 #endif        
@@ -666,6 +693,13 @@ extern "C" void app_main()
 {
     setup();
     serialQueue = xQueueCreate(4096, 1);
+
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.uri = mqttBroker;
+    mqtt_cfg.event_handle = mqtt_event_handler;
+    mqtt_cfg.username = TOKEN;
+
+    client = esp_mqtt_client_init(&mqtt_cfg);
 
     TaskHandle_t hTask;
     xTaskCreate(loop_task, "neurosky", 4096, NULL, configMAX_PRIORITIES - 3, &hTask);

@@ -5,14 +5,16 @@
             "includePath": [
                 "${workspaceRoot}",
                 "${IDF_PATH}/components",
-                "${IDF_PATH}/components/esp32/include"
+                "${IDF_PATH}/components/esp32/include",
+                "${workspaceRoot}/components/**/include"
             ],
             "intelliSenseMode": "clang-x64",
             "browse": {
                 "path": [
                     "${workspaceRoot}",
                     "${IDF_PATH}/components",
-                    "${IDF_PATH}/components/esp32/include"
+                    "${IDF_PATH}/components/esp32/include",
+                    "${workspaceRoot}/components/**/include"
                 ],
                 "limitSymbolsToIncludedHeaders": true,
                 "databaseFilename": "${workspaceRoot}/.vscode/browse.vc.db"
