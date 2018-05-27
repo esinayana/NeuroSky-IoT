@@ -81,7 +81,6 @@ typedef struct {
     app_gap_state_t state;
 } app_gap_cb_t;
 
-
 static const esp_spp_mode_t esp_spp_mode = ESP_SPP_MODE_CB;
 static const esp_spp_sec_t sec_mask = ESP_SPP_SEC_NONE;
 static const esp_spp_role_t role_master = ESP_SPP_ROLE_MASTER;
@@ -94,6 +93,13 @@ static app_gap_cb_t m_dev_info;
 
 QueueHandle_t serialQueue;
 
+byte poorQuality = 0;
+byte attention = 0;
+byte meditation = 0;
+bool bigPacket = false;
+
+long lastReceivedPacket = 0;
+byte payloadData[64] = {};
 
 static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
 {
@@ -140,22 +146,28 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
         break;
+
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
         esp_mqtt_client_start(client);
         break;
+
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
         break;
+
     case MQTT_EVENT_UNSUBSCRIBED:
         ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
         break;
+
     case MQTT_EVENT_PUBLISHED:
         ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
         break;
+
     case MQTT_EVENT_DATA:
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         break;
+
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
         break;
@@ -211,10 +223,12 @@ static void update_device_info(esp_bt_gap_cb_param_t *param)
             cod = *(uint32_t *)(p->val);
             ESP_LOGI(TAG, "--Class of Device: 0x%x", cod);
             break;
+
         case ESP_BT_GAP_DEV_PROP_RSSI:
             rssi = *(int8_t *)(p->val);
             ESP_LOGI(TAG, "--RSSI: %d", rssi);
             break;
+
         case ESP_BT_GAP_DEV_PROP_BDNAME:
             memcpy(bdname, p->val, p->len);
             bdname[p->len] = '\0';
@@ -227,17 +241,6 @@ static void update_device_info(esp_bt_gap_cb_param_t *param)
     }
 
     app_gap_cb_t* p_dev = &m_dev_info;
-#if 0
-    /* search for device with MAJOR service class as "rendering" in COD */
-    if (p_dev->dev_found && 0 != memcmp(param->disc_res.bda, p_dev->bda, ESP_BD_ADDR_LEN)) {
-        return;
-    }
-
-    if (!esp_bt_gap_is_valid_cod(cod) ||
-        !(esp_bt_gap_get_cod_major_dev(cod) == ESP_BT_COD_MAJOR_DEV_PHONE)) {
-        return;
-    }
-#endif  // 0
 
     memcpy(p_dev->bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
     p_dev->dev_found = true;
@@ -292,10 +295,14 @@ void bt_app_gap_init(void)
 
 static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 {
+    app_gap_cb_t *p_dev = &m_dev_info;
     switch (event) {
     case ESP_SPP_INIT_EVT:
         ESP_LOGI(TAG, "ESP_SPP_INIT_EVT");
         esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
+
+        /* start to discover nearby Bluetooth devices */
+        p_dev->state = APP_GAP_STATE_DEVICE_DISCOVERING;
         esp_bt_gap_start_discovery(inq_mode, inq_len, inq_num_rsps);
         break;
 
@@ -306,31 +313,31 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
             ESP_LOGI(TAG, "ESP_SPP_INIT_EVT %d %s", param->disc_comp.scn[0], bda2str(m_dev_info.bda, bda_str, 18));
             esp_spp_connect(sec_mask, role_master, param->disc_comp.scn[0], m_dev_info.bda);
         } else {
+            p_dev->state = APP_GAP_STATE_DEVICE_DISCOVERING;
             esp_bt_gap_start_discovery(inq_mode, inq_len, inq_num_rsps);
         }
         break;
 
     case ESP_SPP_OPEN_EVT:
         ESP_LOGI(TAG, "ESP_SPP_OPEN_EVT");
-//        esp_spp_write(param->srv_open.handle, SPP_DATA_LEN, spp_data);
-//        gettimeofday(&time_old, NULL);
         break;
 
     case ESP_SPP_CLOSE_EVT:
         ESP_LOGI(TAG, "ESP_SPP_CLOSE_EVT");
+        p_dev->state = APP_GAP_STATE_DEVICE_DISCOVERING;
         esp_bt_gap_start_discovery(inq_mode, inq_len, inq_num_rsps);
         break;
 
     case ESP_SPP_START_EVT:
         ESP_LOGI(TAG, "ESP_SPP_START_EVT");
         break;
+
     case ESP_SPP_CL_INIT_EVT:
         ESP_LOGI(TAG, "ESP_SPP_CL_INIT_EVT");
         break;
 
     case ESP_SPP_DATA_IND_EVT:
         for (int i = 0; i < param->data_ind.len; ++i) {
-//            if (!serialBuffer.pushBack(param->data_ind.data[i])) {
             if (xQueueSend(serialQueue, &param->data_ind.data[i], 10 / portTICK_RATE_MS) != pdTRUE) {
                 ESP_LOGW(TAG, "serial in> [!] buffer overflow! Dropping %d bytes", param->data_ind.len - i);
                 break;
@@ -342,24 +349,12 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 #if (SPP_SHOW_MODE == SPP_SHOW_DATA)
         ESP_LOGI(TAG, "ESP_SPP_CONG_EVT cong=%d", param->cong.cong);
 #endif
-        if (param->cong.cong == 0) {
-//            esp_spp_write(param->cong.handle, SPP_DATA_LEN, spp_data);
-        }
         break;
 
     case ESP_SPP_WRITE_EVT:
 #if (SPP_SHOW_MODE == SPP_SHOW_DATA)
         ESP_LOGI(TAG, "ESP_SPP_WRITE_EVT len=%d cong=%d", param->write.len , param->write.cong);
-#else
-        gettimeofday(&time_new, NULL);
-        data_num += param->write.len;
-        if (time_new.tv_sec - time_old.tv_sec >= 3) {
-            print_speed();
-        }
 #endif
-        if (param->write.cong == 0) {
-  //          esp_spp_write(param->write.handle, SPP_DATA_LEN, spp_data);
-        }
         break;
 
     case ESP_SPP_SRV_OPEN_EVT:
@@ -397,6 +392,7 @@ void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
         }
         break;
     }
+
     case ESP_BT_GAP_RMT_SRVCS_EVT: {
         if (memcmp(param->rmt_srvcs.bda, p_dev->bda, ESP_BD_ADDR_LEN) == 0 &&
             p_dev->state == APP_GAP_STATE_SERVICE_DISCOVERING) {
@@ -406,7 +402,6 @@ void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
                 for (int i = 0; i < param->rmt_srvcs.num_uuids; i++) {
                     esp_bt_uuid_t *u = param->rmt_srvcs.uuid_list + i;
                     ESP_LOGI(TAG, "--%s", uuid2str(u, uuid_str, 37));
-                    // trace(TAG, "--%d", u->len);
                 }
             } else {
                 ESP_LOGI(TAG, "Services for device %s not found",  bda2str(p_dev->bda, bda_str, 18));
@@ -425,9 +420,6 @@ void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 
 void initBluetooth()
 {
-//    char *dev_name = "ESP_GAP_INQRUIY";
-//    esp_bt_dev_set_device_name(dev_name);
-
     /* set discoverable and connectable mode, wait to be connected */
     esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE);
 
@@ -448,10 +440,6 @@ void initBluetooth()
     /* initialize device information and status */
     app_gap_cb_t *p_dev = &m_dev_info;
     memset(p_dev, 0, sizeof(app_gap_cb_t));
-
-    /* start to discover nearby Bluetooth devices */
-    p_dev->state = APP_GAP_STATE_DEVICE_DISCOVERING;
-//    esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
 }
 
 
@@ -555,14 +543,6 @@ void setup()
     ESP_LOGE(TAG, "setup() OK");
 }
 
-byte poorQuality = 0;
-byte attention = 0;
-byte meditation = 0;
-bool bigPacket = false;
-
-long lastReceivedPacket = 0;
-
-
 
 ////////////////////////////////
 // Read data from Serial UART //
@@ -570,15 +550,11 @@ long lastReceivedPacket = 0;
 byte ReadOneByte()
 {
     byte val;
-//    while (!serialBuffer.popFront(&val));
 
     while (!xQueueReceive(serialQueue, &val, (portTickType)portMAX_DELAY));
 
     return val;
 }
-
-
-byte payloadData[64] = {};
 
 
 void loop()
@@ -616,8 +592,6 @@ void loop()
             generatedChecksum = 255 - generatedChecksum;   //Take one's compliment of generated checksum
 
             if (checksum == generatedChecksum) {
-//                trace(0, "got packet len %d", payloadLength);
-
                 poorQuality = 200;
                 attention = 0;
                 meditation = 0;
@@ -629,20 +603,25 @@ void loop()
                         poorQuality = payloadData[i];
                         bigPacket = true;
                         break;
+
                     case 4:
                         i++;
                         attention = payloadData[i];
                         break;
+
                     case 5:
                         i++;
                         meditation = payloadData[i];
                         break;
+
                     case 0x80:
                         i = i + 3;
                         break;
+
                     case 0x83:
                         i = i + 25;
                         break;
+
                     default:
                         break;
                     } // switch
@@ -651,12 +630,6 @@ void loop()
 #if !DEBUGOUTPUT
 
                 if (bigPacket) {
-#if 0
-                    if (poorQuality == 0)
-                        digitalWrite(LED, HIGH);
-                    else
-                        digitalWrite(LED, LOW);
-#endif
                     ESP_LOGI(TAG, "PoorQuality: %d, Attention: %d, Meditation: %d, Time since last packet: %ld",
                         poorQuality, attention, meditation, millis() - lastReceivedPacket);
 
@@ -670,7 +643,6 @@ void loop()
 
                     int msg_id = esp_mqtt_client_publish(client, topic, payload, 0, 0, 0);
                     ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
-//                    client.publish(topic, payload);
                 }
 #endif        
                 bigPacket = false;
