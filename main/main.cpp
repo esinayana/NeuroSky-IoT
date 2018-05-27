@@ -26,9 +26,7 @@
 #include "time.h"
 #include "sys/time.h"
 
-extern "C" {
 #include "mqtt_client.h"
-}
 
 typedef unsigned char   byte;
 
