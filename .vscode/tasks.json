@@ -10,6 +10,9 @@
                 "isDefault": true
             },
             "command": "make",
+            "args": [
+                "-j4"
+            ],
             "type": "shell",
             "presentation": {
                 "reveal": "always"
